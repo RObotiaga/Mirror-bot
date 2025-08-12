@@ -13,6 +13,7 @@ from .... import (
 )
 from ....core.config_manager import Config
 from ....core.torrent_manager import TorrentManager
+from ...ext_utils.bot_utils import bt_selection_buttons, get_size_bytes
 from ...ext_utils.bot_utils import bt_selection_buttons
 from ...ext_utils.task_manager import check_running_tasks
 from ...listeners.qbit_listener import on_download_start
@@ -52,6 +53,17 @@ async def add_qb_torrent(listener, path, ratio, seed_time):
         else:
             form = form.include_url(listener.link)
         form = form.savepath(path).tags([f"{listener.mid}"])
+        is_batch_task = bool(listener.batch_size_str)
+        if is_batch_task:
+            listener.is_batch = True
+            listener.batch_size = get_size_bytes(listener.batch_size_str)
+            form = form.stopped(True)
+            add_to_queue = False
+            event = None
+        else:
+            add_to_queue, event = await check_running_tasks(listener)
+            if add_to_queue:
+                form = form.stopped(add_to_queue)
         add_to_queue, event = await check_running_tasks(listener)
         if add_to_queue:
             form = form.stopped(add_to_queue)
@@ -83,6 +95,15 @@ async def add_qb_torrent(listener, path, ratio, seed_time):
         tor_info = tor_info[0]
         listener.name = tor_info.name
         ext_hash = tor_info.hash
+
+        if is_batch_task:
+            listener.all_files = await TorrentManager.qbittorrent.torrents.files(ext_hash)
+            listener.all_files.sort(key=lambda f: f.name)
+            async with task_dict_lock:
+                task_dict[listener.mid] = QbittorrentStatus(listener, queued=False)
+            await on_download_start(f"{listener.mid}")
+            await listener.start_next_batch()
+            return
 
         async with task_dict_lock:
             task_dict[listener.mid] = QbittorrentStatus(listener, queued=add_to_queue)

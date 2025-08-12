@@ -67,46 +67,71 @@ async def _stop_duplicate(tor):
 async def _on_download_complete(tor):
     ext_hash = tor.hash
     tag = tor.tags[0]
-    if task := await get_task_by_gid(ext_hash[:12]):
-        if not task.listener.seed:
-            await TorrentManager.qbittorrent.torrents.stop([ext_hash])
-        if task.listener.select:
-            await clean_unwanted(task.listener.dir)
-            path = tor.content_path.rsplit("/", 1)[0]
-            res = await TorrentManager.qbittorrent.torrents.files(ext_hash)
-            for f in res:
-                if f.priority == 0 and await aiopath.exists(f"{path}/{f.name}"):
-                    try:
-                        await remove(f"{path}/{f.name}")
-                    except:
-                        pass
-        await task.listener.on_download_complete()
-        if intervals["stopAll"]:
-            return
-        if task.listener.seed and not task.listener.is_cancelled:
-            async with task_dict_lock:
-                if task.listener.mid in task_dict:
-                    removed = False
-                    task_dict[task.listener.mid] = QbittorrentStatus(
-                        task.listener, True
-                    )
-                else:
-                    removed = True
-            if removed:
-                await _remove_torrent(ext_hash, tag)
-                return
-            async with qb_listener_lock:
-                if tag in qb_torrents:
-                    qb_torrents[tag]["seeding"] = True
-                else:
-                    return
-            await update_status_message(task.listener.message.chat.id)
-            LOGGER.info(f"Seeding started: {tor.name} - Hash: {ext_hash}")
+    task = await get_task_by_gid(ext_hash[:12])
+    if not task:
+        await _remove_torrent(ext_hash, tag)
+        return
+
+    listener = task.listener
+
+    # НОВАЯ ЛОГИКА ДЛЯ ПАКЕТНОЙ ЗАГРУЗКИ
+    if listener.is_batch:
+        # Проверяем, действительно ли все файлы ТЕКУЩЕГО пакета скачаны
+        # Это дополнительная мера предосторожности
+        files_info = await TorrentManager.qbittorrent.torrents.files(ext_hash)
+        is_batch_complete = True
+        for file_info in listener.current_batch_files:
+            # Находим соответствующий файл в ответе от qBittorrent
+            qbit_file = next((f for f in files_info if f.index == file_info.index), None)
+            if not qbit_file or qbit_file.progress < 1:
+                is_batch_complete = False
+                break
+        
+        if is_batch_complete:
+            LOGGER.info(f"Batch for '{listener.name}' is complete. Starting leech process.")
+            await listener.on_download_complete() # Запускаем on_download_complete в listener'е
         else:
+            LOGGER.warning(f"False positive on download complete for batch '{listener.name}'. Waiting.")
+        return # Выходим, чтобы не удалять торрент
+    # КОНЕЦ НОВОЙ ЛОГИКИ
+
+    # Старая логика для обычных загрузок
+    if not listener.seed:
+        await TorrentManager.qbittorrent.torrents.stop([ext_hash])
+    if listener.select:
+        await clean_unwanted(listener.dir)
+        path = tor.content_path.rsplit("/", 1)[0]
+        res = await TorrentManager.qbittorrent.torrents.files(ext_hash)
+        for f in res:
+            if f.priority == 0 and await aiopath.exists(f"{path}/{f.name}"):
+                try:
+                    await remove(f"{path}/{f.name}")
+                except:
+                    pass
+    await listener.on_download_complete()
+    if intervals["stopAll"]:
+        return
+    if listener.seed and not listener.is_cancelled:
+        async with task_dict_lock:
+            if listener.mid in task_dict:
+                removed = False
+                task_dict[listener.mid] = QbittorrentStatus(
+                    listener, True
+                )
+            else:
+                removed = True
+        if removed:
             await _remove_torrent(ext_hash, tag)
+            return
+        async with qb_listener_lock:
+            if tag in qb_torrents:
+                qb_torrents[tag]["seeding"] = True
+            else:
+                return
+        await update_status_message(listener.message.chat.id)
+        LOGGER.info(f"Seeding started: {tor.name} - Hash: {ext_hash}")
     else:
         await _remove_torrent(ext_hash, tag)
-
 
 @new_task
 async def _qb_listener():
