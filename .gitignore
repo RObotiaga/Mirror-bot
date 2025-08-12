@@ -1,5 +1,5 @@
 mltbenv/*
-config.py
+
 token.pickle
 rclone.conf
 .netrc

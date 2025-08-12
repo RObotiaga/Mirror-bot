@@ -2,6 +2,7 @@ from aiofiles.os import path as aiopath, listdir, remove
 from asyncio import sleep, gather
 from html import escape
 from requests import utils as rutils
+from ...helper.mirror_leech_utils.status_utils.qbit_status import QbittorrentStatus
 
 from ... import (
     intervals,
@@ -72,18 +73,85 @@ class TaskListener(TaskConfig):
     async def remove_from_same_dir(self):
         async with task_dict_lock:
             if (
-                self.folder_name
-                and self.same_dir
-                and self.mid in self.same_dir[self.folder_name]["tasks"]
+                    self.folder_name
+                    and self.same_dir
+                    and self.mid in self.same_dir[self.folder_name]["tasks"]
             ):
                 self.same_dir[self.folder_name]["tasks"].remove(self.mid)
                 self.same_dir[self.folder_name]["total"] -= 1
 
+    async def start_next_batch(self):
+        if self.is_cancelled:
+            return
+
+        if not self.all_files:
+            LOGGER.info(f"All batches have been processed for: {self.name}")
+            # Этот вызов может быть избыточным, но на всякий случай
+            if not self.is_leech:  # Для mirror/clone финальное сообщение отправляется из on_upload_complete
+                await self.on_upload_complete(None, None, None, None)
+            return
+
+        self.current_batch_files.clear()
+        current_batch_size = 0
+        file_ids_for_this_batch = []
+
+        # 1. Формируем следующий пакет
+        temp_files_for_next_round = []
+        for file_info in self.all_files:
+            file_size = file_info.size
+            # Если пакет пуст, добавляем хотя бы один файл, даже если он больше batch_size
+            if not self.current_batch_files:
+                self.current_batch_files.append(file_info)
+                file_ids_for_this_batch.append(file_info.index)
+                current_batch_size += file_size
+            elif current_batch_size + file_size <= self.batch_size:
+                self.current_batch_files.append(file_info)
+                file_ids_for_this_batch.append(file_info.index)
+                current_batch_size += file_size
+            else:
+                temp_files_for_next_round.append(file_info)
+
+        self.all_files = temp_files_for_next_round
+
+        if not self.current_batch_files:
+            LOGGER.error(f"Error creating new batch for {self.name}. No files selected.")
+            await self.on_download_error("Failed to create a new batch.")
+            return
+
+        LOGGER.info(
+            f"Starting batch #{len(self.current_batch_files)} files for {self.name}. Size: {get_readable_file_size(current_batch_size)}")
+
+        try:
+            # 2. Управляем файлами в qBittorrent
+            task = await get_task_by_gid(self.gid)
+            ext_hash = task.hash()
+
+            # Сначала отключаем все файлы в торренте (приоритет 0)
+            all_file_ids = [f.index for f in (await TorrentManager.qbittorrent.torrents.files(ext_hash))]
+            await TorrentManager.qbittorrent.torrents.file_prio(hash=ext_hash, id=all_file_ids, priority=0)
+
+            # Затем включаем только те, которые нужны для текущего пакета
+            await TorrentManager.qbittorrent.torrents.file_prio(hash=ext_hash, id=file_ids_for_this_batch, priority=1)
+
+            # 3. Запускаем/возобновляем загрузку
+            await TorrentManager.qbittorrent.torrents.start([ext_hash])
+
+            # 4. Создаем статус-объект, если его еще нет
+            async with task_dict_lock:
+                if self.mid not in task_dict:
+                    task_dict[self.mid] = QbittorrentStatus(self)
+                    await self.on_download_start()
+                    if self.multi <= 1:
+                        await send_status_message(self.message)
+        except Exception as e:
+            LOGGER.error(f"Error while starting next batch for {self.name}: {e}")
+            await self.on_download_error(str(e))
+
     async def on_download_start(self):
         if (
-            self.is_super_chat
-            and Config.INCOMPLETE_TASK_NOTIFIER
-            and Config.DATABASE_URL
+                self.is_super_chat
+                and Config.INCOMPLETE_TASK_NOTIFIER
+                and Config.DATABASE_URL
         ):
             await database.add_incomplete_task(
                 self.message.chat.id, self.message.link, self.tag
@@ -95,9 +163,9 @@ class TaskListener(TaskConfig):
             return
         multi_links = False
         if (
-            self.folder_name
-            and self.same_dir
-            and self.mid in self.same_dir[self.folder_name]["tasks"]
+                self.folder_name
+                and self.same_dir
+                and self.mid in self.same_dir[self.folder_name]["tasks"]
         ):
             async with same_directory_lock:
                 while True:
@@ -105,8 +173,8 @@ class TaskListener(TaskConfig):
                         if self.mid not in self.same_dir[self.folder_name]["tasks"]:
                             return
                         if (
-                            self.same_dir[self.folder_name]["total"] <= 1
-                            or len(self.same_dir[self.folder_name]["tasks"]) > 1
+                                self.same_dir[self.folder_name]["total"] <= 1
+                                or len(self.same_dir[self.folder_name]["tasks"]) > 1
                         ):
                             if self.same_dir[self.folder_name]["total"] > 1:
                                 self.same_dir[self.folder_name]["tasks"].remove(
@@ -144,6 +212,11 @@ class TaskListener(TaskConfig):
             return
         elif self.same_dir:
             self.seed = False
+
+        if self.is_batch:
+            LOGGER.info(f"Batch download completed for: {self.name}")
+            await self.on_upload_start(self.dir)
+            return
 
         if self.folder_name:
             self.name = self.folder_name.strip("/").split("/", 1)[0]
@@ -186,6 +259,19 @@ class TaskListener(TaskConfig):
             up_path = await self.proceed_extract(up_path, gid)
             if self.is_cancelled:
                 return
+            if self.is_batch:
+                # Очищаем скачанные файлы текущего пакета
+                await clean_download(self.dir)
+
+                # Если еще есть файлы для скачивания, запускаем следующий пакет
+                if self.all_files:
+                    await send_message(self.message,
+                                       f"Batch uploaded. Starting next batch for <code>{self.name}</code>.")
+                    await self.start_next_batch()
+                    return  # ВАЖНО: Выходим, чтобы не отправлять финальное сообщение
+                else:
+                    # Это был последний пакет, позволяем выполниться остальной части функции
+                    LOGGER.info(f"All batches uploaded for: {self.name}")
             self.is_file = await aiopath.isfile(up_path)
             self.name = up_path.replace(f"{up_dir}/", "").split("/", 1)[0]
             self.size = await get_path_size(up_dir)
@@ -307,12 +393,12 @@ class TaskListener(TaskConfig):
         return
 
     async def on_upload_complete(
-        self, link, files, folders, mime_type, rclone_path="", dir_id=""
+            self, link, files, folders, mime_type, rclone_path="", dir_id=""
     ):
         if (
-            self.is_super_chat
-            and Config.INCOMPLETE_TASK_NOTIFIER
-            and Config.DATABASE_URL
+                self.is_super_chat
+                and Config.INCOMPLETE_TASK_NOTIFIER
+                and Config.DATABASE_URL
         ):
             await database.rm_complete_task(self.message.link)
         msg = f"<b>Name: </b><code>{escape(self.name)}</code>\n\n<b>Size: </b>{get_readable_file_size(self.size)}"
@@ -340,10 +426,10 @@ class TaskListener(TaskConfig):
                 msg += f"\n<b>SubFolders: </b>{folders}"
                 msg += f"\n<b>Files: </b>{files}"
             if (
-                link
-                or rclone_path
-                and Config.RCLONE_SERVE_URL
-                and not self.private_link
+                    link
+                    or rclone_path
+                    and Config.RCLONE_SERVE_URL
+                    and not self.private_link
             ):
                 buttons = ButtonMaker()
                 if link:
@@ -412,9 +498,9 @@ class TaskListener(TaskConfig):
             await update_status_message(self.message.chat.id)
 
         if (
-            self.is_super_chat
-            and Config.INCOMPLETE_TASK_NOTIFIER
-            and Config.DATABASE_URL
+                self.is_super_chat
+                and Config.INCOMPLETE_TASK_NOTIFIER
+                and Config.DATABASE_URL
         ):
             await database.rm_complete_task(self.message.link)
 
@@ -450,9 +536,9 @@ class TaskListener(TaskConfig):
             await update_status_message(self.message.chat.id)
 
         if (
-            self.is_super_chat
-            and Config.INCOMPLETE_TASK_NOTIFIER
-            and Config.DATABASE_URL
+                self.is_super_chat
+                and Config.INCOMPLETE_TASK_NOTIFIER
+                and Config.DATABASE_URL
         ):
             await database.rm_complete_task(self.message.link)
 
